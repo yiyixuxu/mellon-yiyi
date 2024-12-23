@@ -203,13 +203,6 @@ class Controlnet(NodeBase):
         return {"controlnet": controlnet}
 
 
-class DepthEstimator(NodeBase):
-    def execute(self, model_id, image, resolution_scale, device):
-        depth_preprocessor = DepthPreprocessor.from_pretrained(model_id).to(device)
-        image = depth_preprocessor(image, resolution_scale=resolution_scale)[0]
-        return {"depth_image": image}
-
-
 class PAGOptionalGuider(NodeBase):
     def execute(self, pag_scale, pag_layers):
         # TODO: Maybe do some validations to ensure correct layers
