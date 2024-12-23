@@ -4,7 +4,7 @@ from diffusers import (
     StableDiffusionXLModularPipeline,
     StableDiffusionXLPipeline,
 )
-from diffusers.guider import CFGGuider, PAGGuider
+from diffusers.guider import PAGGuider
 from diffusers.pipelines.modular_pipeline_builder import SequentialPipelineBlocks
 from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_modular import (
     StableDiffusionXLAutoDenoiseStep,
