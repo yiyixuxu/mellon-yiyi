@@ -35,6 +35,11 @@ MODULE_MAP = {
                 "display": "output",
                 "type": "unet",
             },
+            "scheduler": {
+                "label": "Scheduler",
+                "display": "output",
+                "type": "scheduler",
+            },
             "text_encoders": {
                 "label": "Text Encoders",
                 "display": "output",
@@ -44,11 +49,6 @@ MODULE_MAP = {
                 "label": "Vae",
                 "display": "output",
                 "type": "vae",
-            },
-            "scheduler": {
-                "label": "Scheduler",
-                "display": "output",
-                "type": "scheduler",
             },
         },
     },

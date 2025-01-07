@@ -18,7 +18,7 @@ from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_modula
 )
 from image_gen_aux import DepthPreprocessor
 
-from utils.node_utils import NodeBase
+from mellon.NodeBase import NodeBase
 
 
 class ModelLoader(NodeBase):
