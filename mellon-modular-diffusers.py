@@ -287,7 +287,7 @@ class PAGOptionalGuider(NodeBase):
         # TODO: Maybe do some validations to ensure correct layers
         layers = [item.strip() for item in pag_layers.split(",")]
         guider = PAGGuider(pag_applied_layers=layers)
-        guider_kwargs = {"scale": pag_scale}
+        guider_kwargs = {"pag_scale": pag_scale}
         return {"guider": {"guider": guider, "guider_kwargs": guider_kwargs}}
 
 
