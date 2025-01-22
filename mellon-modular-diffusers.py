@@ -1,123 +1,152 @@
+import os
+
 import torch
-from diffusers import (
-    ControlNetModel,
-    StableDiffusionXLModularPipeline,
-    StableDiffusionXLPipeline,
-)
-from diffusers.guider import PAGGuider
-from diffusers.pipelines.modular_pipeline_builder import SequentialPipelineBlocks
+from diffusers import ControlNetModel, ControlNetUnionModel, ModularPipeline
+from diffusers.guider import APGGuider, PAGGuider
+from diffusers.pipelines.components_manager import ComponentsManager
+from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
+from diffusers.pipelines.modular_pipeline import SequentialPipelineBlocks
 from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_modular import (
-    StableDiffusionXLAutoDenoiseStep,
-    StableDiffusionXLAutoPrepareAdditionalConditioningStep,
-    StableDiffusionXLAutoPrepareLatentsStep,
-    StableDiffusionXLAutoSetTimestepsStep,
-    StableDiffusionXLDecodeLatentsStep,
-    StableDiffusionXLInputStep,
-    StableDiffusionXLTextEncoderStep,
-    StableDiffusionXLVAEEncoderStep,
+    AUTO_BLOCKS,
+    StableDiffusionXLIPAdapterStep,
+    StableDiffusionXLLoraStep,
 )
-from image_gen_aux import DepthPreprocessor
+from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 
 from mellon.NodeBase import NodeBase
 
+all_blocks_map = AUTO_BLOCKS.copy()
+text_block = all_blocks_map.pop("text_encoder")()
+decoder_block = all_blocks_map.pop("decode")()
+image_encoder_block = all_blocks_map.pop("image_encoder")()
 
-class ModelLoader(NodeBase):
-    def execute(self, model_id, variant, dtype):
-        pipeline = StableDiffusionXLPipeline.from_pretrained(
-            model_id, variant=variant, torch_dtype=dtype
+
+class SDXLAutoBlocks(SequentialPipelineBlocks):
+    block_classes = list(all_blocks_map.values())
+    block_names = list(all_blocks_map.keys())
+
+
+class ComponentsLoader(NodeBase):
+    def execute(self, repo_id, variant, device, dtype):
+        components = ComponentsManager()
+        components.add_from_pretrained(repo_id, torch_dtype=dtype, variant=variant)
+        components.enable_auto_cpu_offload(device=device)
+
+        return {"components": components}
+
+
+class TextEncoder(NodeBase):
+    def execute(self, components, positive_prompt, negative_prompt):
+        text_encoder = ModularPipeline.from_block(text_block)
+        text_encoder.update_states(
+            **components.get(
+                ["text_encoder", "text_encoder_2", "tokenizer", "tokenizer_2"]
+            )
         )
-        return {
-            "unet": pipeline.unet,
-            "text_encoders": {
-                "unet": pipeline.unet,
-                "text_encoder": pipeline.text_encoder,
-                "text_encoder_2": pipeline.text_encoder_2,
-                "tokenizer": pipeline.tokenizer,
-                "tokenizer_2": pipeline.tokenizer_2,
-            },
-            "vae": pipeline.vae,
-            "scheduler": pipeline.scheduler,
-        }
 
-
-class EncodePrompts(NodeBase):
-    def execute(self, text_encoders, device, positive_prompt, negative_prompt):
-        text_encoder_workflow = StableDiffusionXLTextEncoderStep()
-        text_encoder_workflow.update_states(
-            text_encoder=text_encoders["text_encoder"],
-            tokenizer=text_encoders["tokenizer"],
-            text_encoder_2=text_encoders["text_encoder_2"],
-            tokenizer_2=text_encoders["tokenizer_2"],
-        )
-
-        text_node = StableDiffusionXLModularPipeline()
-        text_node.add_blocks(text_encoder_workflow)
-
-        text_node.to(device)
-
-        text_state = text_node.run_blocks(
+        text_state = text_encoder(
             prompt=positive_prompt, negative_prompt=negative_prompt
         )
-        text_node.to("cpu")
 
         return {"embeddings": text_state}
 
 
-class EncodeImage(NodeBase):
-    def execute(self, vae, image, device):
-        vae_encoder_workflow = StableDiffusionXLVAEEncoderStep()
-        vae_encoder_workflow.update_states(vae=vae)
-        image_node = StableDiffusionXLModularPipeline()
-        image_node.add_blocks(vae_encoder_workflow)
-        image_node.to(device)
-
-        image_state = image_node.run_blocks(image=image, batch_size=1)
-        latents = image_state.get_intermediate("image_latents")
-
-        return {"latents": latents}
-
-
-class DenoiseLoop(NodeBase):
+class Denoise(NodeBase):
     def execute(
         self,
-        unet,
-        scheduler,
-        device,
+        components,
         embeddings,
         steps,
         cfg,
         seed,
-        height,
         width,
+        height,
+        scheduler,
+        karras,
+        trailing,
+        v_prediction,
+        image,
         strength,
-        image_latents,
-        controlnet,
         guider,
+        lora,
+        controlnet,
+        ip_adapter,
     ):
-        class StableDiffusionXLMainSteps(SequentialPipelineBlocks):
-            block_classes = [
-                StableDiffusionXLInputStep,
-                StableDiffusionXLAutoSetTimestepsStep,
-                StableDiffusionXLAutoPrepareLatentsStep,
-                StableDiffusionXLAutoPrepareAdditionalConditioningStep,
-                StableDiffusionXLAutoDenoiseStep,
-            ]
-            block_prefixes = [
-                "input",
-                "set_timesteps",
-                "prepare_latents",
-                "prepare_add_cond",
-                "denoise",
-            ]
+        class SDXLAutoBlocks(SequentialPipelineBlocks):
+            block_classes = list(all_blocks_map.values())
+            block_names = list(all_blocks_map.keys())
 
-        sdxl_workflow = StableDiffusionXLMainSteps()
+        sdxl_auto_blocks = SDXLAutoBlocks()
+
+        denoise = ModularPipeline.from_block(sdxl_auto_blocks)
+        denoise.update_states(**components.get(["unet", "scheduler", "vae"]))
+
+        # since we need to check always if there are loras loaded
+        lora_step = StableDiffusionXLLoraStep()
+        lora_node = ModularPipeline.from_block(lora_step)
+        lora_node.update_states(
+            **components.get(["text_encoder", "text_encoder_2", "unet"])
+        )
+        active_adapters = lora_node.get_active_adapters()
+
+        if lora:
+            if isinstance(lora, dict):
+                lora = [lora]
+
+            set_adapters_list = []
+            set_adapters_scale_list = []
+
+            active_adapters = lora_node.get_active_adapters()
+            active_adapter_names = set(active_adapters)
+            lora_names = set()
+
+            for single_lora in lora:
+                adapter_name = single_lora["adapter_name"]
+                adapter_scale = single_lora["scale"]
+
+                set_adapters_list.append(adapter_name)
+                set_adapters_scale_list.append(adapter_scale)
+                lora_names.add(adapter_name)
+
+                if adapter_name not in active_adapters:
+                    lora_node.load_lora_weights(
+                        single_lora["lora_path"],
+                        weight_name=single_lora["weight_name"],
+                        adapter_name=single_lora["adapter_name"],
+                    )
+
+            # Unload adapters that are in active_adapters but not in lora
+            adapters_to_unload = active_adapter_names - lora_names
+            lora_node.delete_adapters(adapters_to_unload)
+
+            lora_node.set_adapters(
+                set_adapters_list, adapter_weights=set_adapters_scale_list
+            )
+        else:
+            # if there are no loras in the workflow, no need to check, just unload
+            if len(active_adapters) > 0:
+                lora_node.unload_lora_weights()
+
+        scheduler_options = {}
+
+        if karras:
+            scheduler_options["use_karras_sigmas"] = karras
+
+        if v_prediction:
+            scheduler_options["prediction_type"] = "v_prediction"
+            scheduler_options["rescale_betas_zero_snr"] = True
+
+        if trailing:
+            scheduler_options["timestep_spacing"] = "trailing"
+
+        scheduler_cls = getattr(
+            __import__("diffusers", fromlist=[scheduler]), scheduler
+        )
+        denoise.scheduler = scheduler_cls.from_config(
+            denoise.scheduler.config, **scheduler_options
+        )
 
         generator = torch.Generator(device="cuda").manual_seed(seed)
-
-        modules_kwargs = {
-            "unet": unet,
-            "scheduler": scheduler,
-        }
 
         denoise_kwargs = {
             **embeddings.intermediates,
@@ -125,59 +154,148 @@ class DenoiseLoop(NodeBase):
             "guidance_scale": cfg,
             "height": height,
             "width": width,
+            "output": "latents",
         }
 
-        if controlnet is not None:
-            # TODO: see how to do multicontrolnet
-            modules_kwargs["controlnet"] = controlnet["controlnet_model"]
-            denoise_kwargs["control_image"] = controlnet["image"]
-            denoise_kwargs["controlnet_conditioning_scale"] = controlnet[
-                "conditioning_scale"
-            ]
-            denoise_kwargs["control_guidance_start"] = controlnet["guidance_start"]
-            denoise_kwargs["control_guidance_end"] = controlnet["guidance_end"]
+        if ip_adapter:
+            image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+                ip_adapter["repo_id"],
+                subfolder=ip_adapter["image_encoder_path"],
+                torch_dtype=torch.float16,
+            )
+            feature_extractor = CLIPImageProcessor(size=224, crop_size=224)
 
-        if guider is not None:
-            modules_kwargs["guider"] = guider["guider"]
-            denoise_kwargs["guider_kwargs"] = {"pag_scale": guider["scale"]}
+            components.add("image_encoder", image_encoder)
+            components.add("feature_extractor", feature_extractor)
 
-            if controlnet is not None:
-                modules_kwargs["controlnet_guider"] = guider["guider"]
+            ip_adapter_block = StableDiffusionXLIPAdapterStep()
+            ip_adapter_node = ModularPipeline.from_block(ip_adapter_block)
 
-        sdxl_workflow.update_states(**modules_kwargs)
-        sdxl_node = StableDiffusionXLModularPipeline()
-        sdxl_node.add_blocks(sdxl_workflow)
+            ip_adapter_node.update_states(
+                **components.get(["unet", "image_encoder", "feature_extractor"])
+            )
+            ip_adapter_node.load_ip_adapter(
+                ip_adapter["repo_id"],
+                subfolder=ip_adapter["subfolder"],
+                weight_name=ip_adapter["weight_name"],
+            )
+            ip_adapter_node.set_ip_adapter_scale(ip_adapter["scale"])
 
-        sdxl_node.to(device)
+            ip_adapter_state = ip_adapter_node(ip_adapter_image=ip_adapter["image"])
+            denoise_kwargs.update(ip_adapter_state.intermediates)
 
-        if image_latents is not None:
-            denoise_kwargs["image"] = image_latents
+        if image:
+            image_node = ModularPipeline.from_block(image_encoder_block)
+            image_node.update_states(**components.get(["vae"]))
+            image_state = image_node(image=image, generator=generator)
+
+            denoise_kwargs.update(image_state.intermediates)
             denoise_kwargs["strength"] = strength
             denoise_kwargs["num_inference_steps"] = round(steps / strength)
         else:
             denoise_kwargs["num_inference_steps"] = steps
 
-        state_text2img = sdxl_node.run_blocks(**denoise_kwargs)
+        if controlnet is not None:
+            if isinstance(controlnet, dict):
+                controlnet = [controlnet]
 
-        latents = state_text2img.get_intermediate("latents")
+            # TODO: manage unload of unused controlnets
+            if len(controlnet) == 1:
+                single_controlnet = controlnet[0]
+
+                if single_controlnet.get("control_mode") is not None:
+                    denoise_kwargs["control_mode"] = single_controlnet["control_mode"]
+
+                components.add("controlnet", single_controlnet["controlnet_model"])
+                denoise_kwargs["control_image"] = single_controlnet["image"]
+                denoise_kwargs["controlnet_conditioning_scale"] = single_controlnet[
+                    "conditioning_scale"
+                ]
+                denoise_kwargs["control_guidance_start"] = single_controlnet[
+                    "guidance_start"
+                ]
+                denoise_kwargs["control_guidance_end"] = single_controlnet[
+                    "guidance_end"
+                ]
+            else:
+                controlnet_models = []
+                controlnet_images = []
+                controlnet_scales = []
+                controlnet_start = []
+                controlnet_end = []
+
+                for single_controlnet in controlnet:
+                    controlnet_models.append(single_controlnet["controlnet_model"])
+                    controlnet_images.append(single_controlnet["image"])
+                    controlnet_scales.append(single_controlnet["conditioning_scale"])
+                    controlnet_start.append(single_controlnet["guidance_start"])
+                    controlnet_end.append(single_controlnet["guidance_end"])
+
+                controlnets = MultiControlNetModel(controlnet_models)
+                components.add("controlnet", controlnets)
+
+                denoise_kwargs["control_image"] = controlnet_images
+                denoise_kwargs["controlnet_conditioning_scale"] = controlnet_scales
+                denoise_kwargs["control_guidance_start"] = controlnet_start
+                denoise_kwargs["control_guidance_end"] = controlnet_end
+
+            denoise.update_states(**components.get(["controlnet"]))
+
+        if guider is not None:
+            denoise.update_states(guider=guider["guider"])
+            denoise_kwargs["guider_kwargs"] = guider["guider_kwargs"]
+
+        latents = denoise(**denoise_kwargs)
 
         return {"latents": latents}
 
 
 class DecodeLatents(NodeBase):
-    def execute(self, vae, latents, device):
-        decoder_workflow = StableDiffusionXLDecodeLatentsStep()
-        decoder_workflow.update_states(vae=vae)
+    def execute(self, components, latents):
+        decoder_node = ModularPipeline.from_block(decoder_block)
+        decoder_node.update_states(vae=components.get("vae"))
+        images_output = decoder_node(latents=latents, output="images")
 
-        decoder_node = StableDiffusionXLModularPipeline()
-        decoder_node.add_blocks(decoder_workflow)
-
-        decoder_node.to(device)
-        image_text2img = decoder_node.run_blocks(latents=latents)
-
-        images = image_text2img.get_output("images").images[0]
+        images = images_output.images
 
         return {"images": images}
+
+
+class Lora(NodeBase):
+    def execute(self, path, scale):
+        lora_path = os.path.dirname(path)
+        weight_name = os.path.basename(path)
+        adapter_name = os.path.splitext(weight_name)[0]
+
+        return {
+            "lora": {
+                "lora_path": lora_path,
+                "weight_name": weight_name,
+                "adapter_name": adapter_name,
+                "scale": scale,
+            }
+        }
+
+
+class MultiLora(NodeBase):
+    def execute(self, lora_list):
+        return {"lora": [single_lora for single_lora in lora_list]}
+
+
+class PAGOptionalGuider(NodeBase):
+    def execute(self, pag_scale, pag_layers):
+        # TODO: Maybe do some validations to ensure correct layers
+        layers = [item.strip() for item in pag_layers.split(",")]
+        guider = PAGGuider(pag_applied_layers=layers)
+        guider_kwargs = {"scale": pag_scale}
+        return {"guider": {"guider": guider, "guider_kwargs": guider_kwargs}}
+
+
+class APGOptionalGuider(NodeBase):
+    def execute(self, momentum, rescale_factor):
+        guider = APGGuider()
+        guider_kwargs = {"momentum": momentum, "rescale_factor": rescale_factor}
+        return {"guider": {"guider": guider, "guider_kwargs": guider_kwargs}}
 
 
 class LoadControlnetModel(NodeBase):
@@ -203,10 +321,88 @@ class Controlnet(NodeBase):
         return {"controlnet": controlnet}
 
 
-class PAGOptionalGuider(NodeBase):
-    def execute(self, pag_scale, pag_layers):
-        # TODO: Maybe do some validations to ensure correct layers
-        layers = [item.strip() for item in pag_layers.split(",")]
-        guider = PAGGuider(pag_applied_layers=layers)
+class MultiControlNet(NodeBase):
+    def execute(self, controlnet_list):
+        return {
+            "controlnet": [single_controlnet for single_controlnet in controlnet_list]
+        }
 
-        return {"guider": {"guider": guider, "scale": pag_scale}}
+
+class LoadControlnetUnionModel(NodeBase):
+    def execute(self, model_id, variant, dtype):
+        controlnet_model = ControlNetUnionModel.from_pretrained(
+            model_id, variant=variant, torch_dtype=dtype
+        )
+
+        return {"controlnet_union_model": controlnet_model}
+
+
+class ControlnetUnion(NodeBase):
+    def execute(
+        self,
+        pose_image,
+        depth_image,
+        edges_image,
+        lines_image,
+        normal_image,
+        segment_image,
+        tile_image,
+        repaint_image,
+        conditioning_scale,
+        controlnet_model,
+        guidance_start,
+        guidance_end,
+    ):
+        # Map identifiers to their corresponding index and image
+        image_map = {
+            "pose_image": (pose_image, 0),
+            "depth_image": (depth_image, 1),
+            "edges_image": (edges_image, 2),
+            "lines_image": (lines_image, 3),
+            "normal_image": (normal_image, 4),
+            "segment_image": (segment_image, 5),
+            "tile_image": (tile_image, 6),
+            "repaint_image": (repaint_image, 7),
+        }
+
+        # Initialize control_mode and control_image
+        control_mode = []
+        control_image = []
+
+        # Iterate through the dictionary and add non-None images to the lists
+        for key, (image, index) in image_map.items():
+            if image is not None:
+                control_mode.append(index)
+                control_image.append(image)
+
+        controlnet = {
+            "image": control_image,
+            "control_mode": control_mode,
+            "conditioning_scale": conditioning_scale,
+            "controlnet_model": controlnet_model,
+            "guidance_start": guidance_start,
+            "guidance_end": guidance_end,
+        }
+        return {"controlnet": controlnet}
+
+
+class IPAdapter(NodeBase):
+    def execute(
+        self,
+        image,
+        scale,
+        repo_id,
+        subfolder,
+        weight_name,
+        image_encoder_path,
+    ):
+        ip_adapter = {
+            "image": image,
+            "scale": scale,
+            "repo_id": repo_id,
+            "subfolder": subfolder,
+            "weight_name": weight_name,
+            "image_encoder_path": image_encoder_path,
+        }
+
+        return {"ip_adapter": ip_adapter}
