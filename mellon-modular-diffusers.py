@@ -1,5 +1,6 @@
 import os
 import time
+import copy
 
 import torch
 from diffusers import ControlNetModel, ControlNetUnionModel, ModularPipeline, DiffusionPipeline, UNet2DConditionModel, AutoencoderKL
@@ -81,17 +82,17 @@ def update_lora_adapters(lora_node, lora_list):
 components = ComponentsManager()
 
 
-# class LoadControlnetModel(NodeBase):
-#     def __del__(self):
-#         components.remove(f"controlnet_{self.node_id}")
-#         super().__del__()
+class ControlnetModelLoader(NodeBase):
+    def __del__(self):
+        components.remove(f"controlnet_{self.node_id}")
+        super().__del__()
 
-#     def execute(self, model_id, variant, dtype):
-#         controlnet_model = ControlNetModel.from_pretrained(
-#             model_id, variant=variant, torch_dtype=dtype
-#         )
-#         components.add(f"controlnet_{self.node_id}", controlnet_model)
-#         return {"controlnet_model": components.get_model_info(f"controlnet_{self.node_id}")}
+    def execute(self, model_id, variant, dtype):
+        controlnet_model = ControlNetModel.from_pretrained(
+            model_id, variant=variant, torch_dtype=dtype
+        )
+        components.add(f"controlnet_{self.node_id}", controlnet_model)
+        return {"controlnet_model": components.get_model_info(f"controlnet_{self.node_id}")}
 
 class UNetLoader(NodeBase):
     def __del__(self):
@@ -147,7 +148,7 @@ class SDXLModelsLoader(NodeBase):
         super().__del__()
     
     def __call__(self, **kwargs):
-        self._old_params = self.params.copy()
+        self._old_params = copy.deepcopy(self.params)
         return super().__call__(**kwargs)
 
     def execute(self, repo_id, variant, device, dtype, unet=None, vae=None, lora_list=None, ip_adapter_input=None):
@@ -155,6 +156,7 @@ class SDXLModelsLoader(NodeBase):
             for key in new_params:
                 new_value = new_params.get(key)
                 old_value = old_params.get(key)
+                
                 if new_value is not None and key not in old_params:
                     return True
                 if are_different(old_value, new_value):
@@ -171,12 +173,21 @@ class SDXLModelsLoader(NodeBase):
         print(f" - vae: {vae}")
         print(f" - lora_list: {lora_list}")
         print(f" ip_adapter_input: {ip_adapter_input}")
+        loaded_components = {}
 
         repo_changed = _has_changed(self._old_params, {'repo_id': repo_id, 'variant': variant, 'dtype': dtype})
         unet_input_changed = _has_changed(self._old_params, {'unet': unet})
         vae_input_changed = _has_changed(self._old_params, {'vae': vae})
         lora_input_changed = _has_changed(self._old_params, {'lora_list': lora_list})
-        ip_adapter_input_changed = _has_changed(self._old_params, {'ip_adapter_input': ip_adapter_input})
+
+        # ip_adapter_input_changed = _has_changed(self._old_params, {'ip_adapter_input': ip_adapter_input})
+        if ip_adapter_input and "ip_adapter_input" in self._old_params:
+            filtered_old_pram = {k: w for k, w in self._old_params["ip_adapter_input"].items() if k != "scale"}
+            filtered_ip_adapter_input = {k: w for k, w in ip_adapter_input.items() if k != "scale"}
+            ip_adapter_input_changed = _has_changed(filtered_old_pram, filtered_ip_adapter_input)
+        else:
+            ip_adapter_input_changed = _has_changed(self._old_params, {'ip_adapter_input': ip_adapter_input})
+   
 
         print(f" Changes detected - repo: {repo_changed}, unet: {unet_input_changed}, vae: {vae_input_changed}, "
               f"lora: {lora_input_changed}, ip_adapter: {ip_adapter_input_changed}")
@@ -264,10 +275,20 @@ class SDXLModelsLoader(NodeBase):
             self._ip_adapter_node.unload_ip_adapter()
             
             if ip_adapter_input_changed:
-                print(f" load image_encoder from repo_id: {ip_adapter_input['repo_id']}, subfolder: {ip_adapter_input['image_encoder_path']}, dtype: {dtype}")
+                # Handle single or multiple image encoders
+                repo_ids = ip_adapter_input["repo_id"]
+                image_encoder_paths = ip_adapter_input["image_encoder_path"]
+                
+                # Convert to lists if single values
+                if not isinstance(repo_ids, list):
+                    repo_ids = [repo_ids]
+                    image_encoder_paths = [image_encoder_paths]
+                
+                # Load the first image encoder (they should all be the same)
+                print(f" load image_encoder from repo_id: {repo_ids[0]}, subfolder: {image_encoder_paths[0]}, dtype: {dtype}")
                 image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-                    ip_adapter_input["repo_id"],    
-                    subfolder=ip_adapter_input["image_encoder_path"],
+                    repo_ids[0],    
+                    subfolder=image_encoder_paths[0],
                     torch_dtype=dtype,
                 )
                 feature_extractor = CLIPImageProcessor(size=224, crop_size=224)
@@ -278,18 +299,31 @@ class SDXLModelsLoader(NodeBase):
                 print(f" update ip_adapter from components: ip_adapter_{self.node_id}")
                 self._ip_adapter_node.update_states(image_encoder=image_encoder, feature_extractor=feature_extractor)
 
-            if unet_changed:
-                print(f" update unet")
-                self._ip_adapter_node.update_states(unet=unet)  # Use actual model
+            self._ip_adapter_node.update_states(unet=unet)  # Use actual model
             
-            print(" load ip_adapter")
-            self._ip_adapter_node.load_ip_adapter(
-                ip_adapter_input["repo_id"],
-                subfolder=ip_adapter_input["subfolder"],
-                weight_name=ip_adapter_input["weight_name"],
-            )
-            # Set the scale after loading
-            self._ip_adapter_node.set_ip_adapter_scale(ip_adapter_input["scale"])
+            # Load each IP-Adapter
+            print(" load ip_adapter(s)")
+            if isinstance(ip_adapter_input["repo_id"], list):
+                for i in range(len(ip_adapter_input["repo_id"])):
+                    self._ip_adapter_node.load_ip_adapter(
+                        ip_adapter_input["repo_id"][i],
+                        subfolder=ip_adapter_input["subfolder"][i],
+                        weight_name=ip_adapter_input["weight_name"][i],
+                    )
+            else:
+                self._ip_adapter_node.load_ip_adapter(
+                    ip_adapter_input["repo_id"],
+                    subfolder=ip_adapter_input["subfolder"],
+                    weight_name=ip_adapter_input["weight_name"],
+                )
+                
+        if ip_adapter_input:
+            # Set the scale(s)
+            scales = ip_adapter_input["scale"]
+            if not isinstance(scales, list):
+                scales = [scales]
+            for scale in scales:
+                self._ip_adapter_node.set_ip_adapter_scale(scale)
 
         if unet_changed or vae_changed or repo_changed:
             components.enable_auto_cpu_offload(device=device)
@@ -396,7 +430,16 @@ class Denoise(NodeBase):
 
         if controlnet is not None:
             denoise_kwargs.update(**controlnet["controlnet_inputs"])
-            self._denoise_node.update_states(controlnet=controlnet["controlnet_model"])
+            
+            # For multiple controlnets, get all models from their IDs
+            model_ids = controlnet["controlnet_model"]["model_id"]
+            if isinstance(model_ids, list):
+                controlnet_components = [components.get(model_id) for model_id in model_ids]
+                controlnet_components = MultiControlNetModel(controlnet_components)
+            else:
+                controlnet_components = components.get(model_ids)
+            
+            self._denoise_node.update_states(controlnet=controlnet_components)
 
         if guider is not None:
             self._denoise_node.update_states(guider=guider["guider"])
@@ -462,36 +505,57 @@ class APGOptionalGuider(NodeBase):
         return {"guider": {"guider": guider, "guider_kwargs": guider_kwargs}}
 
 
-# class Controlnet(NodeBase):
-#     def execute(
-#         self, image, conditioning_scale, controlnet_model, guidance_start, guidance_end
-#     ):
-#         controlnet_component = components.get(controlnet_model["model_id"])
-#         controlnet = {
-#             "controlnet_model": controlnet_component,
-#             "controlnet_inputs": {
-#                 "image": image,
-#                 "conditioning_scale": conditioning_scale,
-#                 "guidance_start": guidance_start,
-#                 "guidance_end": guidance_end,
-#             }
-#         }
-#         return {"controlnet": controlnet}
+class Controlnet(NodeBase):
+    def execute(
+        self, 
+        control_image, 
+        controlnet_conditioning_scale, 
+        controlnet_model,
+        control_guidance_start, 
+        control_guidance_end
+    ):
+        controlnet = {
+            "controlnet_model": controlnet_model,
+            "controlnet_inputs": {
+                "control_image": control_image,
+                "controlnet_conditioning_scale": controlnet_conditioning_scale,
+                "control_guidance_start": control_guidance_start,
+                "control_guidance_end": control_guidance_end,
+            }
+        }
+        return {"controlnet": controlnet}
 
 
-# class MultiControlNet(NodeBase):
-#     def execute(self, controlnet_list):
-#         controlnet = {
-#             "controlnet_model": [components.get(c["controlnet_model"]["model_id"]) for c in controlnet_list],
-#             "controlnet_inputs": {
-#                 "image": [c["controlnet_inputs"]["image"] for c in controlnet_list],
-#                 "conditioning_scale": [c["controlnet_inputs"]["conditioning_scale"] for c in controlnet_list],
-#                 "guidance_start": [c["controlnet_inputs"]["guidance_start"] for c in controlnet_list],
-#                 "guidance_end": [c["controlnet_inputs"]["guidance_end"] for c in controlnet_list],
-#             }
-#         }
-#         controlnet["controlnet_model"] = MultiControlNetModel(controlnet["controlnet_model"])
-#         return {"controlnet": controlnet}
+class MultiControlNet(NodeBase):
+    def execute(self, controlnet_list):
+        # Restructure controlnet_model info into lists
+        controlnet_model = {
+            "model_id": [],
+            "added_time": [],
+            "class_name": [],
+            "size_gb": [],
+            "adapters": []
+        }
+        
+        # Fill the lists with values from each controlnet model
+        for c in controlnet_list:
+            model_info = c["controlnet_model"]
+            for key in controlnet_model:
+                controlnet_model[key].append(model_info[key])
+
+        controlnet = {
+            "controlnet_model": controlnet_model,
+            "controlnet_inputs": {
+                "control_image": [c["controlnet_inputs"]["control_image"] for c in controlnet_list],
+                "controlnet_conditioning_scale": [c["controlnet_inputs"]["controlnet_conditioning_scale"] for c in controlnet_list],
+                "control_guidance_start": [c["controlnet_inputs"]["control_guidance_start"] for c in controlnet_list],
+                "control_guidance_end": [c["controlnet_inputs"]["control_guidance_end"] for c in controlnet_list],
+            }
+        }
+
+        return {"controlnet": controlnet}
+
+
 
 
 # class LoadControlnetUnionModel(NodeBase):
@@ -594,4 +658,22 @@ class EncodeIPAdapter(NodeBase):
         ip_adapter_state = self._ip_adapter_node(ip_adapter_image=image)
         # Return the intermediates dict instead of the PipelineState
         return {"ip_adapter_image_embeddings": ip_adapter_state.intermediates}
+
+class MultiIPAdapter(NodeBase):
+    def execute(self, ip_adapter_list):
+        # Initialize the combined ip_adapter dict with the same structure
+        ip_adapter = {
+            "repo_id": [],
+            "subfolder": [],
+            "weight_name": [],
+            "image_encoder_path": [],
+            "scale": [],
+        }
+        
+        # Fill the lists with values from each ip_adapter input
+        for adapter in ip_adapter_list:
+            for key in ip_adapter:
+                ip_adapter[key].append(adapter[key])
+
+        return {"ip_adapter": ip_adapter}
 
