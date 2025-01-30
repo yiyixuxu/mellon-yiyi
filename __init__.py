@@ -148,16 +148,6 @@ MODULE_MAP = {
                 "type": "lora",
                 "spawn": True,
             },
-            "ip_adapter_input": {
-                "label": "IP Adapter",
-                "display": "input",
-                "type": "ip_adapter",
-            },
-            "ip_adapter": {
-                "label": "IP Adapter",
-                "display": "output",
-                "type": "model_info",
-            },
             "text_encoders": {
                 "label": "Text Encoders",
                 "display": "output",
@@ -208,27 +198,6 @@ MODULE_MAP = {
         },
     },
 
-    # "EncodeImage": {
-    #     "label": "Encode Image",
-    #     "category": "Modular Diffusers",
-    #     "params": {
-    #         "vae": {
-    #             "label": "VAE",
-    #             "display": "input",
-    #             "type": "model_info",
-    #         },
-    #         "image": {
-    #             "label": "Image",
-    #             "type": "image",
-    #             "display": "input",
-    #         },
-    #         "image_embeddings": {
-    #             "label": "Image Embeddings",
-    #             "display": "output",
-    #             "type": "image_embeddings",
-    #         },
-    #     },
-    # },
 
     "Denoise": {
         "label": "Denoise",
@@ -539,9 +508,9 @@ MODULE_MAP = {
         },
     },
 
-    "IPAdapter": {
-        "label": "IP-Adapter Config",
-        "description": "Configure IP-Adapter settings",
+    "IPAdapterInput": {
+        "label": "IP-Adapter Input",
+        "description": "Configure IP-Adapter settings and input",
         "category": "Modular Diffusers",
         "params": {
             "repo_id": {
@@ -564,6 +533,11 @@ MODULE_MAP = {
                 "type": "string",
                 "default": "sdxl_models/image_encoder",
             },
+            "image": {
+                "label": "Image",
+                "display": "input",
+                "type": "image",
+            },
             "scale": {
                 "label": "Scale",
                 "type": "float",
@@ -572,52 +546,42 @@ MODULE_MAP = {
                 "max": 1,
                 "step": 0.01,
             },
-            "ip_adapter": {
-                "label": "IP-Adapter",
+            "ip_adapter_input": {
+                "label": "IP-Adapter Input",
                 "display": "output",
                 "type": "ip_adapter",
             },
         },
     },
 
-    "EncodeIPAdapter": {
-        "label": "IP-Adapter Encode",
-        "description": "Encode image using IP-Adapter",
+    "IPAdapter": {
+        "label": "IP-Adapter",
+        "description": "Process images with IP-Adapter",
         "category": "Modular Diffusers",
         "params": {
-            "image": {
-                "label": "Image",
-                "display": "input",
-                "type": "image",
-            },
-            "ip_adapter": {
-                "label": "IP-Adapter",
+            "unet": {
+                "label": "UNet",
                 "display": "input",
                 "type": "model_info",
+            },
+            "ip_adapter_inputs": {
+                "label": "IP-Adapter Inputs",
+                "display": "input",
+                "type": "ip_adapter",
+                "spawn": True,
             },
             "ip_adapter_image_embeddings": {
                 "label": "IP-Adapter Embeddings",
                 "display": "output",
                 "type": "ip_adapter_embeddings",
             },
+            "unet_out": {
+                "label": "UNet",
+                "display": "output",
+                "type": "model_info",
+            },
         },
     },
 
-    "MultiIPAdapter": {
-        "label": "Multi IP-Adapter",
-        "category": "Modular Diffusers",
-        "params": {
-            "ip_adapter_list": {
-                "label": "IP-Adapter",
-                "display": "input",
-                "type": "ip_adapter",
-                "spawn": True,
-            },
-            "ip_adapter": {
-                "label": "Multi IP-Adapter",
-                "type": "ip_adapter", 
-                "display": "output",
-            },
-        },
-    },
+
 }
